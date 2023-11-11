@@ -3,12 +3,12 @@ import time
 import torch
 from collections import OrderedDict
 from copy import deepcopy
+import logging
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 from basicsr.models import lr_scheduler as lr_scheduler
 from basicsr.utils import get_root_logger
 from basicsr.utils.dist_util import master_only
-
 
 class BaseModel():
     """Base model."""
@@ -33,7 +33,7 @@ class BaseModel():
         """Save networks and training state."""
         pass
 
-    def validation(self, dataloader, current_iter, tb_logger, save_img=False):
+    def validation(self, dataloader, current_iter, tb_logger, save_img=False, rgb2bgr=True, use_image=True):
         """Validation function.
 
         Args:
@@ -43,9 +43,9 @@ class BaseModel():
             save_img (bool): Whether to save images. Default: False.
         """
         if self.opt['dist']:
-            self.dist_validation(dataloader, current_iter, tb_logger, save_img)
+            self.dist_validation(dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image)
         else:
-            self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
+            self.nondist_validation(dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image)
 
     def _initialize_best_metric_results(self, dataset_name):
         """Initialize the best metric results dict for recording the best metric value and iteration."""
@@ -121,6 +121,8 @@ class BaseModel():
 
     def setup_schedulers(self):
         """Set up schedulers."""
+        logger = get_root_logger()
+        
         train_opt = self.opt['train']
         scheduler_type = train_opt['scheduler'].pop('type')
         if scheduler_type in ['MultiStepLR', 'MultiStepRestartLR']:
@@ -136,6 +138,8 @@ class BaseModel():
                     torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **train_opt['scheduler']))
         else:
             raise NotImplementedError(f'Scheduler {scheduler_type} is not implemented yet.')
+        
+        logger.info(f"scheduler_type: {scheduler_type}, param: {list(**train_opt['scheduler'])}")
 
     def get_bare_model(self, net):
         """Get bare model, especially under wrapping with

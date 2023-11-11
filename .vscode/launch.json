@@ -12,10 +12,10 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "-opt", "/home/nrc/BasicSR/options/train/TestNet/TestNet.yml",
+                "-opt", "options/train/TestNet_v7/TestNet_v7.yml",
                 // "--input_path", "./demo/1413394889255760384.png",
                 // "--output_path", "./demo/deblur_img.png"
-            ]
+            ],
         }
     ]
 }

@@ -56,7 +56,12 @@ def create_train_val_dataloader(opt, logger):
         elif phase.split('_')[0] == 'val':
             val_set = build_dataset(dataset_opt)
             val_loader = build_dataloader(
-                val_set, dataset_opt, num_gpu=opt['num_gpu'], dist=opt['dist'], sampler=None, seed=opt['manual_seed'])
+                val_set, 
+                dataset_opt, 
+                num_gpu=opt['num_gpu'], 
+                dist=opt['dist'], 
+                sampler=None, 
+                seed=opt['manual_seed'])
             logger.info(f'Number of val images/folders in {dataset_opt["name"]}: {len(val_set)}')
             val_loaders.append(val_loader)
         else:
@@ -203,7 +208,11 @@ def train_pipeline(root_path):
                 if len(val_loaders) > 1:
                     logger.warning('Multiple validation datasets are *only* supported by SRModel.')
                 for val_loader in val_loaders:
-                    model.validation(val_loader, current_iter, tb_logger, opt['val']['save_img'])
+                    rgb2bgr = opt['val'].get('rgb2bgr', True)
+                    # wheather use uint8 image to compute metrics
+                    use_image = opt['val'].get('use_image', True)
+                    model.validation(val_loader, current_iter, tb_logger,
+                                    opt['val']['save_img'], rgb2bgr, use_image )
 
             data_timer.start()
             iter_timer.start()

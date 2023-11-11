@@ -4,9 +4,9 @@ from os import path as osp
 
 from basicsr.utils import get_root_logger, scandir
 from basicsr.utils.registry import LOSS_REGISTRY
-from .gan_loss import g_path_regularize, gradient_penalty_loss, r1_penalty
+from .basic_loss import PSNRLoss, MSELoss, L1Loss, PerceptualLoss
 
-__all__ = ['build_loss', 'gradient_penalty_loss', 'r1_penalty', 'g_path_regularize']
+__all__ = ['build_loss', 'L1Loss', 'MSELoss', 'PSNRLoss', 'PerceptualLoss']
 
 # automatically scan and import loss modules for registry
 # scan all the files under the 'losses' folder and collect files ending with '_loss.py'

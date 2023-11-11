@@ -46,6 +46,22 @@ class ImageRestorationModel(BaseModel):
         self.net_g.train()
         train_opt = self.opt['train']
 
+        self.ema_decay = train_opt.get('ema_decay', 0)
+        if self.ema_decay > 0:
+            logger = get_root_logger()
+            logger.info(f'Use Exponential Moving Average with decay: {self.ema_decay}')
+            # define network net_g with Exponential Moving Average (EMA)
+            # net_g_ema is used only for testing on one GPU and saving
+            # There is no need to wrap with DistributedDataParallel
+            self.net_g_ema = build_network(self.opt['network_g']).to(self.device)
+            # load pretrained model
+            load_path = self.opt['path'].get('pretrain_network_g', None)
+            if load_path is not None:
+                self.load_network(self.net_g_ema, load_path, self.opt['path'].get('strict_load_g', True), 'params_ema')
+            else:
+                self.model_ema(0)  # copy net_g weight
+            self.net_g_ema.eval()
+
         # define losses
         if train_opt.get('pixel_opt'): #PSNRLoss
             self.cri_pix = build_loss(train_opt['pixel_opt']).to(self.device)
@@ -67,119 +83,21 @@ class ImageRestorationModel(BaseModel):
     def setup_optimizers(self):
         train_opt = self.opt['train']
         optim_params = []
-
         for k, v in self.net_g.named_parameters():
             if v.requires_grad:
-        #         if k.startswith('module.offsets') or k.startswith('module.dcns'):
-        #             optim_params_lowlr.append(v)
-        #         else:
                 optim_params.append(v)
-            # else:
-            #     logger = get_root_logger()
-            #     logger.warning(f'Params {k} will not be optimized.')
-        # print(optim_params)
-        # ratio = 0.1
+            else:
+                logger = get_root_logger()
+                logger.warning(f'Params {k} will not be optimized.')
 
         optim_type = train_opt['optim_g'].pop('type')
-        if optim_type == 'Adam':
-            self.optimizer_g = torch.optim.Adam([{'params': optim_params}],
-                                                **train_opt['optim_g'])
-        elif optim_type == 'SGD':
-            self.optimizer_g = torch.optim.SGD(optim_params,
-                                               **train_opt['optim_g'])
-        elif optim_type == 'AdamW':
-            self.optimizer_g = torch.optim.AdamW([{'params': optim_params}],
-                                                **train_opt['optim_g'])
-            pass
-        else:
-            raise NotImplementedError(
-                f'optimizer {optim_type} is not supperted yet.')
+        self.optimizer_g = self.get_optimizer(optim_type, optim_params, **train_opt['optim_g'])
         self.optimizers.append(self.optimizer_g)
 
     def feed_data(self, data, is_val=False):
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
-
-    def grids(self):
-        b, c, h, w = self.gt.size()
-        self.original_size = (b, c, h, w)
-
-        assert b == 1
-        if 'crop_size_h' in self.opt['val']:
-            crop_size_h = self.opt['val']['crop_size_h']
-        else:
-            crop_size_h = int(self.opt['val'].get('crop_size_h_ratio') * h)
-
-        if 'crop_size_w' in self.opt['val']:
-            crop_size_w = self.opt['val'].get('crop_size_w')
-        else:
-            crop_size_w = int(self.opt['val'].get('crop_size_w_ratio') * w)
-
-
-        crop_size_h, crop_size_w = crop_size_h // self.scale * self.scale, crop_size_w // self.scale * self.scale
-        #adaptive step_i, step_j
-        num_row = (h - 1) // crop_size_h + 1
-        num_col = (w - 1) // crop_size_w + 1
-
-        import math
-        step_j = crop_size_w if num_col == 1 else math.ceil((w - crop_size_w) / (num_col - 1) - 1e-8)
-        step_i = crop_size_h if num_row == 1 else math.ceil((h - crop_size_h) / (num_row - 1) - 1e-8)
-
-        scale = self.scale
-        step_i = step_i//scale*scale
-        step_j = step_j//scale*scale
-
-        parts = []
-        idxes = []
-
-        i = 0  # 0~h-1
-        last_i = False
-        while i < h and not last_i:
-            j = 0
-            if i + crop_size_h >= h:
-                i = h - crop_size_h
-                last_i = True
-
-            last_j = False
-            while j < w and not last_j:
-                if j + crop_size_w >= w:
-                    j = w - crop_size_w
-                    last_j = True
-                parts.append(self.lq[:, :, i // scale :(i + crop_size_h) // scale, j // scale:(j + crop_size_w) // scale])
-                idxes.append({'i': i, 'j': j})
-                j = j + step_j
-            i = i + step_i
-
-        self.origin_lq = self.lq
-        self.lq = torch.cat(parts, dim=0)
-        self.idxes = idxes
-
-    def grids_inverse(self):
-        preds = torch.zeros(self.original_size)
-        b, c, h, w = self.original_size
-
-        count_mt = torch.zeros((b, 1, h, w))
-        if 'crop_size_h' in self.opt['val']:
-            crop_size_h = self.opt['val']['crop_size_h']
-        else:
-            crop_size_h = int(self.opt['val'].get('crop_size_h_ratio') * h)
-
-        if 'crop_size_w' in self.opt['val']:
-            crop_size_w = self.opt['val'].get('crop_size_w')
-        else:
-            crop_size_w = int(self.opt['val'].get('crop_size_w_ratio') * w)
-
-        crop_size_h, crop_size_w = crop_size_h // self.scale * self.scale, crop_size_w // self.scale * self.scale
-
-        for cnt, each_idx in enumerate(self.idxes):
-            i = each_idx['i']
-            j = each_idx['j']
-            preds[0, :, i: i + crop_size_h, j: j + crop_size_w] += self.outs[cnt]
-            count_mt[0, 0, i: i + crop_size_h, j: j + crop_size_w] += 1.
-
-        self.output = (preds / count_mt).to(self.device)
-        self.lq = self.origin_lq
 
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
@@ -228,27 +146,21 @@ class ImageRestorationModel(BaseModel):
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
+        if self.ema_decay > 0:
+            self.model_ema(decay=self.ema_decay)
+
     def test(self):
-        self.net_g.eval()
-        with torch.no_grad():
-            n = len(self.lq)
-            outs = []
-            m = self.opt['val'].get('max_minibatch', n)
-            i = 0
-            while i < n:
-                j = i + m
-                if j >= n:
-                    j = n
-                pred = self.net_g(self.lq[i:j])
-                if isinstance(pred, list):
-                    pred = pred[-1]
-                outs.append(pred.detach().cpu())
-                i = j
+        if hasattr(self, 'net_g_ema'):
+            self.net_g_ema.eval()
+            with torch.no_grad():
+                self.output = self.net_g_ema(self.lq)
+        else:
+            self.net_g.eval()
+            with torch.no_grad():
+                self.output = self.net_g(self.lq)
+            self.net_g.train()
 
-            self.output = torch.cat(outs, dim=0)
-        self.net_g.train()
-
-    def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
+    def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         dataset_name = dataloader.dataset.opt['name']
         with_metrics = self.opt['val'].get('metrics') is not None
         use_pbar = self.opt['val'].get('pbar', False)
@@ -273,7 +185,7 @@ class ImageRestorationModel(BaseModel):
 
             visuals = self.get_current_visuals()
             sr_img = tensor2img([visuals['result']])
-            metric_data['img'] = sr_img
+            metric_data['img1'] = sr_img
             if 'gt' in visuals:
                 gt_img = tensor2img([visuals['gt']])
                 metric_data['img2'] = gt_img
@@ -345,5 +257,8 @@ class ImageRestorationModel(BaseModel):
         return out_dict
 
     def save(self, epoch, current_iter):
-        self.save_network(self.net_g, 'net_g', current_iter)
+        if hasattr(self, 'net_g_ema'):
+            self.save_network([self.net_g, self.net_g_ema], 'net_g', current_iter, param_key=['params', 'params_ema'])
+        else:
+            self.save_network(self.net_g, 'net_g', current_iter)
         self.save_training_state(epoch, current_iter)
