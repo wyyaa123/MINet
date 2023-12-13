@@ -1,0 +1,67 @@
+# ------------------------------------------------------------------------
+# Copyright (c) 2022 megvii-model. All Rights Reserved.
+# ------------------------------------------------------------------------
+# Modified from BasicSR (https://github.com/xinntao/BasicSR)
+# Copyright 2018-2020 BasicSR Authors
+# ------------------------------------------------------------------------
+# general settings
+name: ReformerNet-GoPro
+model_type: ImageRestorationModel
+scale: 1
+num_gpu: 1 # set num_gpu: 0 for cpu mode
+manual_seed: 10
+
+# dataset and data loader settings
+datasets:
+
+  test:
+    name: gopro-test
+    type: PairedImageDataset
+
+    dataroot_gt: ./datasets/GoPro/test/target.lmdb
+    dataroot_lq: ./datasets/GoPro/test/input.lmdb
+
+    io_backend:
+      type: lmdb
+
+# network structures
+network_g:
+  type: Reformer
+  inp_ch: 3
+  oup_ch: 3
+  width: 32
+  patch_w: 2
+  patch_h: 2
+  enc_blk_nums: [1, 1, 1, 2]
+  enc_blk_use: [False, False, True, True]
+  middle_blk_nums: 3
+  dec_blk_nums: [2, 1, 1, 1]
+  dec_blk_use: [True, True, False, False]
+  bias: False # "BiasFree" or "WithBias"
+  ffn_multiplier: 2
+  attn_multiplier: !!float .5
+
+# path
+path:
+  pretrain_network_g: experiments/ReformerNet-v1-GoPro/models/net_g_latest.pth
+  strict_load_g: true
+  resume_state: ~
+
+# validation settings
+val:
+  save_img: true
+
+  metrics:
+    psnr: # metric name, can be arbitrary
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500

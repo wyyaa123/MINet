@@ -177,7 +177,6 @@ class PerceptualLoss(nn.Module):
     """Perceptual loss with commonly used style loss.
 
     Args:
-        beta (float): 
         layer_weights (dict): The weight for each layer of vgg feature.
             Here is an example: {'conv5_4': 1.}, which means the conv5_4
             feature layer (before relu5_4) will be extracted with weight
@@ -198,7 +197,6 @@ class PerceptualLoss(nn.Module):
     """
 
     def __init__(self,
-                 beta,
                  layer_weights,
                  vgg_type='vgg19',
                  use_input_norm=True,
@@ -207,7 +205,6 @@ class PerceptualLoss(nn.Module):
                  style_weight=0.,
                  criterion='l1'):
         super(PerceptualLoss, self).__init__()
-        self.beta = beta
         self.perceptual_weight = perceptual_weight
         self.style_weight = style_weight
         self.layer_weights = layer_weights
@@ -249,7 +246,7 @@ class PerceptualLoss(nn.Module):
                     percep_loss += torch.norm(x_features[k] - gt_features[k], p='fro') * self.layer_weights[k]
                 else:
                     percep_loss += self.criterion(x_features[k], gt_features[k]) * self.layer_weights[k]
-            percep_loss *= self.perceptual_weight * self.beta
+            percep_loss *= self.perceptual_weight
         else:
             percep_loss = None
 
@@ -263,7 +260,7 @@ class PerceptualLoss(nn.Module):
                 else:
                     style_loss += self.criterion(self._gram_mat(x_features[k]), self._gram_mat(
                         gt_features[k])) * self.layer_weights[k]
-            style_loss *= self.style_weight * self.beta
+            style_loss *= self.style_weight
         else:
             style_loss = None
 

@@ -103,8 +103,9 @@ def parse_options(root_path, is_train=True):
     parser.add_argument('--auto_resume', action='store_true')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--local_rank', type=int, default=0)
-    parser.add_argument(
-        '--force_yml', nargs='+', default=None, help='Force to update yml files. Examples: train:ema_decay=0.999')
+    parser.add_argument('--force_yml', nargs='+', default=None, help='Force to update yml files. Examples: train:ema_decay=0.999')
+    parser.add_argument('--input_path', type=str, required=False, help='The path to the input image. For single image inference only.')
+    parser.add_argument('--output_path', type=str, required=False, help='The path to the output image. For single image inference only.')
     args = parser.parse_args()
 
     # parse yml to dict
@@ -169,6 +170,12 @@ def parse_options(root_path, is_train=True):
     for key, val in opt['path'].items():
         if (val is not None) and ('resume_state' in key or 'pretrain_network' in key):
             opt['path'][key] = osp.expanduser(val)
+            
+    if args.input_path is not None and args.output_path is not None:
+        opt['img_path'] = {
+            'input_img': args.input_path,
+            'output_img': args.output_path
+        }
 
     if is_train:
         experiments_root = opt['path'].get('experiments_root')

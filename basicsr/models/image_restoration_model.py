@@ -11,6 +11,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from os import path as osp
 from tqdm import tqdm
+from functools import partial
 
 from basicsr.archs import build_network
 from basicsr.losses import build_loss
@@ -134,7 +135,6 @@ class ImageRestorationModel(BaseModel):
                 l_total += l_style
                 loss_dict['l_style'] = l_style
 
-
         l_total = l_total + 0. * sum(p.sum() for p in self.net_g.parameters())
 
         l_total.backward()
@@ -149,18 +149,56 @@ class ImageRestorationModel(BaseModel):
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
 
-    def test(self):
+    # def test(self):
+    #     if hasattr(self, 'net_g_ema'):
+    #         self.net_g_ema.eval()
+    #         with torch.no_grad():
+    #             self.output = self.net_g_ema(self.lq)
+    #     else:
+    #         self.net_g.eval()
+    #         with torch.no_grad():
+    #             self.output = self.net_g(self.lq)
+    #         self.net_g.train()
+
+    def pad_test(self, window_size):        
+        scale = self.opt.get('scale', 1)
+        mod_pad_h, mod_pad_w = 0, 0
+        _, _, h, w = self.lq.size()
+        if h % window_size != 0:
+            mod_pad_h = window_size - h % window_size
+        if w % window_size != 0:
+            mod_pad_w = window_size - w % window_size
+        img = F.pad(self.lq, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+        self.nonpad_test(img)
+        _, _, h, w = self.output.size()
+        self.output = self.output[:, :, 0: h - mod_pad_h * scale, 0: w - mod_pad_w * scale]
+
+    def nonpad_test(self, img=None):
+        if img is None:
+            img = self.lq      
         if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
             with torch.no_grad():
-                self.output = self.net_g_ema(self.lq)
+                pred = self.net_g_ema(img)
+            if isinstance(pred, list):
+                pred = pred[-1]
+            self.output = pred
         else:
             self.net_g.eval()
             with torch.no_grad():
-                self.output = self.net_g(self.lq)
+                pred = self.net_g(img)
+            if isinstance(pred, list):
+                pred = pred[-1]
+            self.output = pred
             self.net_g.train()
 
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
+        if self.opt['rank'] == 0:
+            self.nondist_validation(dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image)
+        else:
+            return 0
+
+    def nondist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         dataset_name = dataloader.dataset.opt['name']
         with_metrics = self.opt['val'].get('metrics') is not None
         use_pbar = self.opt['val'].get('pbar', False)
@@ -178,17 +216,25 @@ class ImageRestorationModel(BaseModel):
         if use_pbar:
             pbar = tqdm(total=len(dataloader), unit='image')
 
+        window_size = self.opt['val'].get('window_size', 0)
+
+        if window_size:
+            test = partial(self.pad_test, window_size)
+        else:
+            test = self.nonpad_test
+
         for idx, val_data in enumerate(dataloader):
             img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
             self.feed_data(val_data)
-            self.test()
+            # self.test()
+            test()
 
             visuals = self.get_current_visuals()
-            sr_img = tensor2img([visuals['result']])
-            metric_data['img1'] = sr_img
+            sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
+            metric_data['img1'] = sr_img if use_image else visuals['result']
             if 'gt' in visuals:
-                gt_img = tensor2img([visuals['gt']])
-                metric_data['img2'] = gt_img
+                gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
+                metric_data['img2'] = gt_img if use_image else visuals['gt']
                 del self.gt
 
             # tentative for out of GPU memory
@@ -200,14 +246,21 @@ class ImageRestorationModel(BaseModel):
                 if self.opt['is_train']:
                     save_img_path = osp.join(self.opt['path']['visualization'], img_name,
                                              f'{img_name}_{current_iter}.png')
+                    save_gt_img_path = osp.join(self.opt['path']['visualization'],
+                                             img_name, f'{img_name}_gt.png')
                 else:
                     if self.opt['val']['suffix']:
                         save_img_path = osp.join(self.opt['path']['visualization'], dataset_name,
                                                  f'{img_name}_{self.opt["val"]["suffix"]}.png')
+                        save_gt_img_path = osp.join(self.opt['path']['visualization'], dataset_name,
+                                                 f'{img_name}_{self.opt["val"]["suffix"]}_gt.png')
                     else:
                         save_img_path = osp.join(self.opt['path']['visualization'], dataset_name,
                                                  f'{img_name}_{self.opt["name"]}.png')
+                        save_gt_img_path = osp.join(self.opt['path']['visualization'], dataset_name,
+                                                 f'{img_name}_{self.opt["name"]}_gt.png')
                 imwrite(sr_img, save_img_path)
+                imwrite(gt_img, save_gt_img_path)
 
             if with_metrics:
                 # calculate metrics
@@ -226,11 +279,6 @@ class ImageRestorationModel(BaseModel):
                 self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
-
-    def nondist_validation(self, *args, **kwargs):
-        logger = get_root_logger()
-        logger.warning('nondist_validation is not implemented. Run dist_validation.')
-        self.dist_validation(*args, **kwargs)
 
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):

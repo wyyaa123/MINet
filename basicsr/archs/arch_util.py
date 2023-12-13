@@ -1,17 +1,15 @@
-import collections.abc
-import math
 import torch
-import torchvision
-import warnings
-from distutils.version import LooseVersion
-from itertools import repeat
+from torch import Tensor
 from torch import nn as nn
-from torch.nn import functional as F
 from torch.nn import init as init
+from torch.nn import functional as F
+from torch import Tensor, Size
 from torch.nn.modules.batchnorm import _BatchNorm
-
-from basicsr.ops.dcn import ModulatedDeformConvPack, modulated_deform_conv
+from typing import Optional, List, Tuple, overload, Union
 from basicsr.utils import get_root_logger
+
+from einops import rearrange
+import numbers
 
 
 @torch.no_grad()
@@ -45,307 +43,222 @@ def default_init_weights(module_list, scale=1, bias_fill=0, **kwargs):
                     m.bias.data.fill_(bias_fill)
 
 
-def make_layer(basic_block, num_basic_block, **kwarg):
-    """Make layers by stacking the same blocks.
+class LayerNorm(nn.LayerNorm):
+    r"""
+    Applies `Layer Normalization <https://arxiv.org/abs/1607.06450>`_ over a input tensor
 
     Args:
-        basic_block (nn.module): nn.module class for basic block.
-        num_basic_block (int): number of blocks.
+        normalized_shape (int or list or torch.Size): input shape from an expected input
+            of size
 
-    Returns:
-        nn.Sequential: Stacked blocks in nn.Sequential.
-    """
-    layers = []
-    for _ in range(num_basic_block):
-        layers.append(basic_block(**kwarg))
-    return nn.Sequential(*layers)
+            .. math::
+                [* \times \text{normalized\_shape}[0] \times \text{normalized\_shape}[1]
+                    \times \ldots \times \text{normalized\_shape}[-1]]
 
+            If a single integer is used, it is treated as a singleton list, and this module will
+            normalize over the last dimension which is expected to be of that specific size.
+        eps (Optional, float): Value added to the denominator for numerical stability. Default: 1e-5
+        elementwise_affine (bool): If ``True``, use learnable affine parameters. Default: ``True``
 
-class ResidualBlockNoBN(nn.Module):
-    """Residual block without BN.
-
-    Args:
-        num_feat (int): Channel number of intermediate features.
-            Default: 64.
-        res_scale (float): Residual scale. Default: 1.
-        pytorch_init (bool): If set to True, use pytorch default init,
-            otherwise, use default_init_weights. Default: False.
+    Shape:
+        - Input: :math:`(N, *)` where :math:`N` is the batch size
+        - Output: same shape as the input
     """
 
-    def __init__(self, num_feat=64, res_scale=1, pytorch_init=False):
-        super(ResidualBlockNoBN, self).__init__()
-        self.res_scale = res_scale
-        self.conv1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
-        self.conv2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
-        self.relu = nn.ReLU(inplace=True)
+    def __init__(
+        self,
+        normalized_shape: Union[int, List[int], Size],
+        eps: Optional[float] = 1e-5,
+        elementwise_affine: Optional[bool] = True,
+        *args,
+        **kwargs
+    ):
+        super().__init__(
+            normalized_shape=normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+        )
 
-        if not pytorch_init:
-            default_init_weights([self.conv1, self.conv2], 0.1)
-
-    def forward(self, x):
-        identity = x
-        out = self.conv2(self.relu(self.conv1(x)))
-        return identity + out * self.res_scale
-
-
-class Upsample(nn.Sequential):
-    """Upsample module.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-    """
-
-    def __init__(self, scale, num_feat):
-        m = []
-        if (scale & (scale - 1)) == 0:  # scale = 2^n
-            for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
-                m.append(nn.PixelShuffle(2))
-        elif scale == 3:
-            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
-            m.append(nn.PixelShuffle(3))
-        else:
-            raise ValueError(f'scale {scale} is not supported. Supported scales: 2^n and 3.')
-        super(Upsample, self).__init__(*m)
-
-
-def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros', align_corners=True):
-    """Warp an image or feature map with optical flow.
-
-    Args:
-        x (Tensor): Tensor with size (n, c, h, w).
-        flow (Tensor): Tensor with size (n, h, w, 2), normal value.
-        interp_mode (str): 'nearest' or 'bilinear'. Default: 'bilinear'.
-        padding_mode (str): 'zeros' or 'border' or 'reflection'.
-            Default: 'zeros'.
-        align_corners (bool): Before pytorch 1.3, the default value is
-            align_corners=True. After pytorch 1.3, the default value is
-            align_corners=False. Here, we use the True as default.
-
-    Returns:
-        Tensor: Warped image or feature map.
-    """
-    assert x.size()[-2:] == flow.size()[1:3]
-    _, _, h, w = x.size()
-    # create mesh grid
-    grid_y, grid_x = torch.meshgrid(torch.arange(0, h).type_as(x), torch.arange(0, w).type_as(x))
-    grid = torch.stack((grid_x, grid_y), 2).float()  # W(x), H(y), 2
-    grid.requires_grad = False
-
-    vgrid = grid + flow
-    # scale grid to [-1,1]
-    vgrid_x = 2.0 * vgrid[:, :, :, 0] / max(w - 1, 1) - 1.0
-    vgrid_y = 2.0 * vgrid[:, :, :, 1] / max(h - 1, 1) - 1.0
-    vgrid_scaled = torch.stack((vgrid_x, vgrid_y), dim=3)
-    output = F.grid_sample(x, vgrid_scaled, mode=interp_mode, padding_mode=padding_mode, align_corners=align_corners)
-
-    # TODO, what if align_corners=False
-    return output
-
-
-def resize_flow(flow, size_type, sizes, interp_mode='bilinear', align_corners=False):
-    """Resize a flow according to ratio or shape.
-
-    Args:
-        flow (Tensor): Precomputed flow. shape [N, 2, H, W].
-        size_type (str): 'ratio' or 'shape'.
-        sizes (list[int | float]): the ratio for resizing or the final output
-            shape.
-            1) The order of ratio should be [ratio_h, ratio_w]. For
-            downsampling, the ratio should be smaller than 1.0 (i.e., ratio
-            < 1.0). For upsampling, the ratio should be larger than 1.0 (i.e.,
-            ratio > 1.0).
-            2) The order of output_size should be [out_h, out_w].
-        interp_mode (str): The mode of interpolation for resizing.
-            Default: 'bilinear'.
-        align_corners (bool): Whether align corners. Default: False.
-
-    Returns:
-        Tensor: Resized flow.
-    """
-    _, _, flow_h, flow_w = flow.size()
-    if size_type == 'ratio':
-        output_h, output_w = int(flow_h * sizes[0]), int(flow_w * sizes[1])
-    elif size_type == 'shape':
-        output_h, output_w = sizes[0], sizes[1]
-    else:
-        raise ValueError(f'Size type should be ratio or shape, but got type {size_type}.')
-
-    input_flow = flow.clone()
-    ratio_h = output_h / flow_h
-    ratio_w = output_w / flow_w
-    input_flow[:, 0, :, :] *= ratio_w
-    input_flow[:, 1, :, :] *= ratio_h
-    resized_flow = F.interpolate(
-        input=input_flow, size=(output_h, output_w), mode=interp_mode, align_corners=align_corners)
-    return resized_flow
-
-
-# TODO: may write a cpp file
-def pixel_unshuffle(x, scale):
-    """ Pixel unshuffle.
-
-    Args:
-        x (Tensor): Input feature with shape (b, c, hh, hw).
-        scale (int): Downsample ratio.
-
-    Returns:
-        Tensor: the pixel unshuffled feature.
-    """
-    b, c, hh, hw = x.size()
-    out_channel = c * (scale**2)
-    assert hh % scale == 0 and hw % scale == 0
-    h = hh // scale
-    w = hw // scale
-    x_view = x.view(b, c, h, scale, w, scale)
-    return x_view.permute(0, 1, 3, 5, 2, 4).reshape(b, out_channel, h, w)
-
-
-class DCNv2Pack(ModulatedDeformConvPack):
-    """Modulated deformable conv for deformable alignment.
-
-    Different from the official DCNv2Pack, which generates offsets and masks
-    from the preceding features, this DCNv2Pack takes another different
-    features to generate offsets and masks.
-
-    ``Paper: Delving Deep into Deformable Alignment in Video Super-Resolution``
-    """
-
-    def forward(self, x, feat):
-        out = self.conv_offset(feat)
-        o1, o2, mask = torch.chunk(out, 3, dim=1)
-        offset = torch.cat((o1, o2), dim=1)
-        mask = torch.sigmoid(mask)
-
-        offset_absmean = torch.mean(torch.abs(offset))
-        if offset_absmean > 50:
-            logger = get_root_logger()
-            logger.warning(f'Offset abs mean is {offset_absmean}, larger than 50.')
-
-        if LooseVersion(torchvision.__version__) >= LooseVersion('0.9.0'):
-            return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias, self.stride, self.padding,
-                                                 self.dilation, mask)
-        else:
-            return modulated_deform_conv(x, offset, mask, self.weight, self.bias, self.stride, self.padding,
-                                         self.dilation, self.groups, self.deformable_groups)
-
-class LayerNormFunction(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
-        N, C, H, W = x.size()
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        y = (x - mu) / (var + eps).sqrt()
-        ctx.save_for_backward(y, var, weight)
-        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        eps = ctx.eps
-
-        N, C, H, W = grad_output.size()
-        y, var, weight = ctx.saved_variables
-        g = grad_output * weight.view(1, C, 1, 1)
-        mean_g = g.mean(dim=1, keepdim=True)
-
-        mean_gy = (g * y).mean(dim=1, keepdim=True)
-        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
-        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
-            dim=0), None
-
-class LayerNorm2d(nn.Module):
-
-    def __init__(self, channels, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.channels = channels
-        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
-        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
-        self.eps = eps
-
-    def forward(self, x):
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
-
-def _no_grad_trunc_normal_(tensor, mean, std, a, b):
-    # From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/weight_init.py
-    # Cut & paste from PyTorch official master until it's in a few official releases - RW
-    # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
-    def norm_cdf(x):
-        # Computes standard normal cumulative distribution function
-        return (1. + math.erf(x / math.sqrt(2.))) / 2.
-
-    if (mean < a - 2 * std) or (mean > b + 2 * std):
-        warnings.warn(
-            'mean is more than 2 std from [a, b] in nn.init.trunc_normal_. '
-            'The distribution of values may be incorrect.',
-            stacklevel=2)
-
-    with torch.no_grad():
-        # Values are generated by using a truncated uniform distribution and
-        # then using the inverse CDF for the normal distribution.
-        # Get upper and lower cdf values
-        low = norm_cdf((a - mean) / std)
-        up = norm_cdf((b - mean) / std)
-
-        # Uniformly fill tensor with values from [low, up], then translate to
-        # [2l-1, 2u-1].
-        tensor.uniform_(2 * low - 1, 2 * up - 1)
-
-        # Use inverse cdf transform for normal distribution to get truncated
-        # standard normal
-        tensor.erfinv_()
-
-        # Transform to proper mean, std
-        tensor.mul_(std * math.sqrt(2.))
-        tensor.add_(mean)
-
-        # Clamp to ensure it's in the proper range
-        tensor.clamp_(min=a, max=b)
-        return tensor
-
-
-def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
-    r"""Fills the input Tensor with values drawn from a truncated
-    normal distribution.
-
-    From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/weight_init.py
-
-    The values are effectively drawn from the
-    normal distribution :math:`\mathcal{N}(\text{mean}, \text{std}^2)`
-    with values outside :math:`[a, b]` redrawn until they are within
-    the bounds. The method used for generating the random values works
-    best when :math:`a \leq \text{mean} \leq b`.
-
-    Args:
-        tensor: an n-dimensional `torch.Tensor`
-        mean: the mean of the normal distribution
-        std: the standard deviation of the normal distribution
-        a: the minimum cutoff value
-        b: the maximum cutoff value
-
-    Examples:
-        >>> w = torch.empty(3, 5)
-        >>> nn.init.trunc_normal_(w)
-    """
-    return _no_grad_trunc_normal_(tensor, mean, std, a, b)
-
-
-# From PyTorch
-def _ntuple(n):
-
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable):
+    def forward(self, x: Tensor) -> Tensor:
+        n_dim = x.ndim
+        if x.shape[1] == self.normalized_shape[0] and n_dim > 2:  # channel-first format
+            s, u = torch.std_mean(x, dim=1, keepdim=True, unbiased=False)
+            x = (x - u) / (s + self.eps)
+            if self.weight is not None:
+                # Using fused operation for performing affine transformation: x = (x * weight) + bias
+                n_dim = x.ndim - 2
+                new_shape = [1, self.normalized_shape[0]] + [1] * n_dim
+                x = torch.addcmul(
+                    input=self.bias.reshape(*[new_shape]),
+                    value=1.0,
+                    tensor1=x,
+                    tensor2=self.weight.reshape(*[new_shape]),
+                )
             return x
-        return tuple(repeat(x, n))
+        elif x.shape[-1] == self.normalized_shape[0]:  # channel-last format
+            return super().forward(x)
+        else:
+            raise NotImplementedError(
+                "LayerNorm is supported for channel-first and channel-last format only"
+            )
+        
 
-    return parse
+class ConvLayer2d(nn.Module):
+    """
+    Applies a 2D convolution over an input
+
+    Args:
+        in_channels (int): :math:`C_{in}` from an expected input of size :math:`(N, C_{in}, H_{in}, W_{in})`
+        out_channels (int): :math:`C_{out}` from an expected output of size :math:`(N, C_{out}, H_{out}, W_{out})`
+        kernel_size (Union[int, Tuple[int, int]]): Kernel size for convolution.
+        stride (Union[int, Tuple[int, int]]): Stride for convolution. Default: 1
+        groups (Optional[int]): Number of groups in convolution. Default: 1
+        bias (Optional[bool]): Use bias. Default: ``False``
+        use_norm (Optional[bool]): Use normalization layer after convolution. Default: ``True``
+        _layer (Optional[bool]): Use activation layer after convolution (or convolution and normalization).
+                                Default: ``nn.ReLU``
+
+    Shape:
+        - Input: :math:`(N, C_{in}, H_{in}, W_{in})`
+        - Output: :math:`(N, C_{out}, H_{out}, W_{out})`
+
+    .. note::
+        For depth-wise convolution, `groups=C_{in}=C_{out}`.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Optional[Union[int, Tuple[int, int]]] = 1,
+        dilation: Optional[Union[int, Tuple[int, ...]]] = 1,
+        groups: Optional[int] = 1,
+        bias: Optional[bool] = False,
+        use_norm: bool = False,
+        use_act: bool = False,
+        norm_layer: nn.Module = None,
+        act_layer: nn.Module = None,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+
+        if isinstance(stride, int):
+            stride = (stride, stride)
+
+        assert isinstance(kernel_size, Tuple)
+        assert isinstance(stride, Tuple)
+
+        padding = (
+            int((kernel_size[0] - 1) / 2) * dilation,
+            int((kernel_size[1] - 1) / 2) * dilation,
+        )
+
+        block = nn.Sequential()
+
+        conv_layer = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            groups=groups,
+            padding=padding,
+            dilation=dilation,
+            bias=bias
+        )
+
+        block.add_module(name="conv", module=conv_layer)
+
+        if use_norm and norm_layer == None:
+            norm_layer = nn.BatchNorm2d(out_channels)
+            block.add_module(name="norm", module=norm_layer)
+        elif use_norm and norm_layer != None:
+            block.add_module(name="norm", module=norm_layer)
+            
+        if use_act and act_layer == None:
+            act_layer = nn.SiLU(inplace=True)
+            block.add_module(name="act_layer", module=act_layer)
+        elif use_act and act_layer != None:
+            block.add_module(name="act_layer", module=act_layer)
+
+        self.block = block
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.block(x)
 
 
-to_1tuple = _ntuple(1)
-to_2tuple = _ntuple(2)
-to_3tuple = _ntuple(3)
-to_4tuple = _ntuple(4)
-to_ntuple = _ntuple
+class ChannelShuffle(nn.Module):
+    def __init__(self):
+        super(ChannelShuffle, self).__init__()
+    def forward(self, x):
+        batchsize, num_channels, height, width = x.data.size()
+        assert (num_channels % 4 == 0)
+        x = x.reshape(batchsize * num_channels // 2, 2, height * width)
+        x = x.permute(1, 0, 2)
+        x = x.reshape(2, -1, num_channels // 2, height, width)
+        return x[0], x[1]
+
+
+class DownSample(nn.Module):
+    r""" DownSample Layer modified from swin-transformer.
+    inp_shape: B, C, H, W
+    oup_shape: B, 2 * C, H, W
+
+    Args:
+        inp_ch (int): Number of input channels.
+        norm_type (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, inp_ch, bias, norm_type=LayerNorm):
+        super().__init__()
+        self.inp_ch = inp_ch
+        # self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.reduction = nn.Conv2d(4 * inp_ch, 2 * inp_ch, kernel_size=1, stride=1, padding=0, bias=bias)
+        self.norm = norm_type(4 * inp_ch)
+
+    def forward(self, x):
+        """
+        x: B, C, H, W
+        """
+        B, C, H, W = x.shape
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+
+        x0 = x[:, :, 0::2, 0::2]  # B C H/2 W/2 
+        x1 = x[:, :, 1::2, 0::2]  # B C H/2 W/2 
+        x2 = x[:, :, 0::2, 1::2]  # B C H/2 W/2 
+        x3 = x[:, :, 1::2, 1::2]  # B C H/2 W/2 
+        x = torch.cat([x0, x1, x2, x3], 1)  # B 4*C H/2 W/2
+
+        x = self.norm(x)
+        x = self.reduction(x)
+
+        return x
+    
+
+def make_divisible(
+    v: Union[float, int],
+    divisor: Optional[int] = 8,
+    min_value: Optional[Union[float, int]] = None,
+) -> Union[float, int]:
+    """
+    This function is taken from the original tf repo.
+    It ensures that all layers have a channel number that is divisible by 8
+    It can be seen here:
+    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+    :param v:
+    :param divisor:
+    :param min_value:
+    :return:
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+    
